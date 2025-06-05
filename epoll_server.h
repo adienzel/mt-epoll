@@ -22,6 +22,9 @@
 #include <netinet/tcp.h>
 #include <optional>
 
+#include "RingBuffer.h"
+
+
 #ifndef MT_EPOLL_EPOLL_SERVER_H
 #define MT_EPOLL_EPOLL_SERVER_H
 
@@ -34,7 +37,7 @@ static inline int createSocket(uint16_t port);
 
 static inline void accept_request(int k, int socketFd, int eFd, epoll_event &event);
 
-void send_data(const epoll_event *events, int i, const char *buffer, size_t len);
+void send_data(const epoll_event *events, int i, char *buffer, size_t len);
 
 void loop_events(int k, int socketFd, int eFd, epoll_event &event, const epoll_event *events, int numOfEvents);
 
@@ -136,9 +139,17 @@ void loop_events(int k, int socketFd, int eFd, epoll_event &event, const epoll_e
  */
 void loop_read_and_send(int eFd, const epoll_event *events, int i, bool running_loop) {
     char buffer[4096];
+
+    // will replace the buffer from a ring buffer
+    struct iovec iov;
+    struct msghdr msg = {};
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
     
     while (true) {
-        auto len = read(events[i].data.fd, buffer, sizeof(buffer));
+        auto len = recvmsg(events[i].data.fd, &msg, 0);
         if (len < 0 && errno == EINTR) {
             //std::cout << "EINTR " << events[i].data.fd << std::endl;
             continue;
@@ -164,8 +175,15 @@ void loop_read_and_send(int eFd, const epoll_event *events, int i, bool running_
  * @param buffer 
  * @param len 
  */
-void send_data(const epoll_event *events, int i, const char *buffer, size_t len) {
-    len = send(events[i].data.fd, buffer, len, MSG_NOSIGNAL);
+void send_data(const epoll_event *events, int i, char *buffer, size_t len) {
+    struct msghdr msg = {};
+    struct iovec iov = {buffer, len};
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_flags |= MSG_ZEROCOPY;  // Enable zero-copy
+
+    len = sendmsg(events[i].data.fd, &msg, MSG_NOSIGNAL);
     if (len == (size_t)-1) {
         std::cout << "error sending data, " << strerror(errno) << std::endl;
     }
