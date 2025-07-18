@@ -86,14 +86,18 @@ static inline void handle_accept_response(int k, int eFd, epoll_event &event, in
 //    std::cout << "worker : " << k << " accept " << std::endl;
     event.events = EPOLLIN;
     event.data.fd = tfd;
-    epoll_ctl(eFd, EPOLL_CTL_ADD, tfd, &event);
+    if (epoll_ctl(eFd, EPOLL_CTL_ADD, tfd, &event) == -1) {
+        std::cout << "epoll_ctl add client error: " << getErrorString(errno) << std::endl;
+        close(tfd);
+        return;
+    }
 }
 
 void buildSocketInside(uint16_t port, int k) {
     std::cout << " Worker : " << k << " run " << __func__ << std::endl;
     
     auto socketFd = createSocket(port);
-    int eFd = epoll_create(1);
+    int eFd = epoll_create1(EPOLL_CLOEXEC);
     if (eFd == -1) {
         std::cout << "create epoll fail" << std::endl;
         return;
@@ -102,7 +106,11 @@ void buildSocketInside(uint16_t port, int k) {
     epoll_event event{};
     event.events = EPOLLIN;
     event.data.fd = socketFd;
-    epoll_ctl(eFd, EPOLL_CTL_ADD, socketFd, &event);
+    if (epoll_ctl(eFd, EPOLL_CTL_ADD, socketFd, &event) == -1) {
+        std::cout << "epoll_ctl add socket error: " << getErrorString(errno) << std::endl;
+        close(eFd);
+        return;
+    }
     epoll_event events[EVENT_NUM];
     
     while (true) {
@@ -138,9 +146,9 @@ void loop_events(int k, int socketFd, int eFd, epoll_event &event, const epoll_e
  * @param running_loop 
  */
 void loop_read_and_send(int eFd, const epoll_event *events, int i, bool running_loop) {
+    thread_local static RingBuffer buffer_pool(8192);
     char buffer[4096];
 
-    // will replace the buffer from a ring buffer
     struct iovec iov;
     struct msghdr msg = {};
     iov.iov_base = buffer;

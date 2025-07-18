@@ -46,7 +46,7 @@ int main(int argc, const char **argv) {
         CPU_ZERO(&cpuset);
         CPU_SET(i, &cpuset);
         if (int rc = pthread_setaffinity_np(threads[i].native_handle(), sizeof(cpu_set_t), &cpuset); rc != 0) {
-            std::cout <<  "Error calling pthread_setaffinity_np: " << strerror(errno)  << std::endl;
+            std::cout <<  "Error calling pthread_setaffinity_np: " << strerror(rc)  << std::endl;
         }
     }
     

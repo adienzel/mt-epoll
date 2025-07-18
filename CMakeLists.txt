@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(mt_epoll)
 
 set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_FLAGS "${CAMKE_CXX_FLAGS} -pthread -Wall -Wpedantic")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -Wall -Wpedantic")
 
 add_executable(mt_epoll 
                main.cpp 
