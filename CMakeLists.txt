@@ -2,7 +2,9 @@ cmake_minimum_required(VERSION 3.20)
 project(mt_epoll)
 
 set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_FLAGS "${CAMKE_CXX_FLAGS} -pthread -Wall -Wpedantic")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -Wall -Wpedantic")
+
+find_package(OpenSSL REQUIRED)
 
 add_executable(mt_epoll 
                main.cpp 
@@ -10,4 +12,8 @@ add_executable(mt_epoll
                getLinuxVersion.h 
                getInterfaceIndex.h
                RingBuffer.h
+               TLSConfig.h
+               SPMCThreadPool.h
                )
+
+target_link_libraries(mt_epoll OpenSSL::SSL OpenSSL::Crypto)

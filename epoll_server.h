@@ -21,16 +21,32 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <optional>
+#include <unordered_map>
+#include <memory>
+#include <linux/errqueue.h>
 
 #include "RingBuffer.h"
+#include "TLSConfig.h"
+#include "SPMCThreadPool.h"
 
 
 #ifndef MT_EPOLL_EPOLL_SERVER_H
 #define MT_EPOLL_EPOLL_SERVER_H
 
 constexpr uint16_t PORT = 8088;
-
 constexpr int EVENT_NUM = 20;
+constexpr size_t RING_BUFFER_SIZE = 1024 * 1024;
+
+struct ConnectionContext {
+    SSL* ssl = nullptr;
+    std::shared_ptr<RingBuffer> input_buffer;
+    std::shared_ptr<RingBuffer> output_buffer;
+    bool tls_handshake_complete = false;
+    uint32_t pending_sends = 0;
+};
+
+static std::unordered_map<int, std::unique_ptr<ConnectionContext>> connections;
+static std::mutex connections_mutex;
 
 
 static inline int createSocket(uint16_t port);
@@ -38,10 +54,12 @@ static inline int createSocket(uint16_t port);
 static inline void accept_request(int k, int socketFd, int eFd, epoll_event &event);
 
 void send_data(const epoll_event *events, int i, char *buffer, size_t len);
+void send_data_zero_copy(int fd, std::shared_ptr<RingBuffer> output_buffer);
+bool handle_zero_copy_completion(int fd);
 
-void loop_events(int k, int socketFd, int eFd, epoll_event &event, const epoll_event *events, int numOfEvents);
+void loop_events(int k, int socketFd, int eFd, epoll_event &event, const epoll_event *events, int numOfEvents, SPMCThreadPool& thread_pool);
 
-void loop_read_and_send(int eFd, const epoll_event *events, int i, bool running_loop);
+void loop_read_and_send(int eFd, const epoll_event *events, int i, bool running_loop, SPMCThreadPool& thread_pool);
 
 bool setNonBlocking(int sockfd) {
     int flags = fcntl(sockfd, F_GETFL, 0);
@@ -83,13 +101,30 @@ static inline void handle_accept_response(int k, int eFd, epoll_event &event, in
         std::cout << "accept error: " << getErrorString(errno) << std::endl;
         return;
     }
-//    std::cout << "worker : " << k << " accept " << std::endl;
-    event.events = EPOLLIN;
+
+    auto ctx = std::make_unique<ConnectionContext>();
+    ctx->input_buffer = std::make_shared<RingBuffer>(RING_BUFFER_SIZE);
+    ctx->output_buffer = std::make_shared<RingBuffer>(RING_BUFFER_SIZE);
+    
+    if (TLSManager::getInstance().isEnabled()) {
+        ctx->ssl = TLSManager::getInstance().createSSL();
+        if (ctx->ssl) {
+            SSL_set_fd(ctx->ssl, tfd);
+            SSL_set_accept_state(ctx->ssl);
+        }
+    }
+    
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex);
+        connections[tfd] = std::move(ctx);
+    }
+    
+    event.events = EPOLLIN | EPOLLERR;
     event.data.fd = tfd;
     epoll_ctl(eFd, EPOLL_CTL_ADD, tfd, &event);
 }
 
-void buildSocketInside(uint16_t port, int k) {
+void buildSocketInside(uint16_t port, int k, const TLSConfig& tls_config) {
     std::cout << " Worker : " << k << " run " << __func__ << std::endl;
     
     auto socketFd = createSocket(port);
@@ -98,6 +133,8 @@ void buildSocketInside(uint16_t port, int k) {
         std::cout << "create epoll fail" << std::endl;
         return;
     }
+
+    auto thread_pool = std::make_unique<SPMCThreadPool>(tls_config.worker_threads_per_epoll);
     
     epoll_event event{};
     event.events = EPOLLIN;
@@ -111,20 +148,23 @@ void buildSocketInside(uint16_t port, int k) {
             std::cout << "epoll error" << std::endl;
             return;
         }
-       // std::this_thread::sleep_for((std::chrono::seconds(1)));
-        loop_events(k, socketFd, eFd, event, events, numOfEvents);
+        loop_events(k, socketFd, eFd, event, events, numOfEvents, *thread_pool);
     }
 }
 
-void loop_events(int k, int socketFd, int eFd, epoll_event &event, const epoll_event *events, int numOfEvents) {
+void loop_events(int k, int socketFd, int eFd, epoll_event &event, const epoll_event *events, int numOfEvents, SPMCThreadPool& thread_pool) {
     for (int i = 0; i < numOfEvents; ++i) {
         if (events[i].data.fd == socketFd) {
             accept_request(k, socketFd, eFd, event);
         } else {
-            // in this mode i don't check data
+            if (events[i].events & EPOLLERR) {
+                if (handle_zero_copy_completion(events[i].data.fd)) {
+                    continue;
+                }
+            }
             
             auto running_loop = true;
-            loop_read_and_send(eFd, events, i, running_loop);
+            loop_read_and_send(eFd, events, i, running_loop, thread_pool);
         }
     }
 }
@@ -137,35 +177,103 @@ void loop_events(int k, int socketFd, int eFd, epoll_event &event, const epoll_e
  * @param buffer 
  * @param running_loop 
  */
-void loop_read_and_send(int eFd, const epoll_event *events, int i, bool running_loop) {
-    char buffer[4096];
+void loop_read_and_send(int eFd, const epoll_event *events, int i, bool running_loop, SPMCThreadPool& thread_pool) {
+    int fd = events[i].data.fd;
+    std::unique_lock<std::mutex> lock(connections_mutex);
+    auto conn_it = connections.find(fd);
+    if (conn_it == connections.end()) {
+        lock.unlock();
+        return;
+    }
+    
+    auto& ctx = conn_it->second;
+    char* buffer = ctx->input_buffer->getWriteBuffer(4096);
+    if (!buffer) {
+        return;
+    }
 
-    // will replace the buffer from a ring buffer
     struct iovec iov;
     struct msghdr msg = {};
     iov.iov_base = buffer;
-    iov.iov_len = sizeof(buffer);
+    iov.iov_len = 4096;
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     
     while (true) {
-        auto len = recvmsg(events[i].data.fd, &msg, 0);
-        if (len < 0 && errno == EINTR) {
-            //std::cout << "EINTR " << events[i].data.fd << std::endl;
-            continue;
+        ssize_t len;
+        
+        if (TLSManager::getInstance().isEnabled() && ctx->ssl) {
+            if (!ctx->tls_handshake_complete) {
+                int ret = SSL_accept(ctx->ssl);
+                if (ret <= 0) {
+                    int ssl_error = SSL_get_error(ctx->ssl, ret);
+                    if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                        break;
+                    } else {
+                        running_loop = false;
+                        break;
+                    }
+                }
+                ctx->tls_handshake_complete = true;
+            }
+            
+            len = SSL_read(ctx->ssl, buffer, 4096);
+            if (len <= 0) {
+                int ssl_error = SSL_get_error(ctx->ssl, len);
+                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                    break;
+                } else {
+                    running_loop = false;
+                    break;
+                }
+            }
+        } else {
+            len = recvmsg(fd, &msg, 0);
+            if (len < 0 && errno == EINTR) {
+                continue;
+            }
+            if (len < 0) {
+                std::cout << "Read error: " << strerror(errno) << std::endl;
+                running_loop = false;
+                break;
+            } else if (len == 0) {
+                std::cout << "EOF Closed connection - descriptor = " << fd << std::endl;
+                epoll_ctl(eFd, EPOLL_CTL_DEL, fd, nullptr);
+                running_loop = false;
+                break;
+            }
         }
-        if (len < 0) {
-            std::cout << "Read error, %s " << strerror(errno) << std::endl;
-            running_loop = false;
-        } else if (len == 0) {
-            std::cout << "EOF Closed connection - descriptor = " << events[i].data.fd << std::endl;
-            epoll_ctl(eFd, EPOLL_CTL_DEL, events[i].data.fd, nullptr);
-            running_loop = false;
-        }
-        if (running_loop) {
-            send_data(events, i, buffer, len);
+        
+        if (running_loop && len > 0) {
+            ctx->input_buffer->advanceWrite(len);
+            
+            WorkItem work_item;
+            work_item.client_fd = fd;
+            work_item.ssl = ctx->ssl;
+            work_item.input_buffer = ctx->input_buffer;
+            work_item.output_buffer = ctx->output_buffer;
+            work_item.data_len = len;
+            work_item.is_tls = TLSManager::getInstance().isEnabled() && ctx->ssl;
+            
+            thread_pool.enqueue(std::move(work_item));
         }
         break;
+    }
+    
+    if (!running_loop) {
+        if (ctx->ssl) {
+            SSL_free(ctx->ssl);
+        }
+        if (lock.owns_lock()) {
+            connections.erase(fd);
+            lock.unlock();
+        } else {
+            std::lock_guard<std::mutex> cleanup_lock(connections_mutex);
+            connections.erase(fd);
+        }
+        close(fd);
+    } else {
+        lock.unlock();
     }
 }
 /**
@@ -181,12 +289,82 @@ void send_data(const epoll_event *events, int i, char *buffer, size_t len) {
 
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
-    msg.msg_flags |= MSG_ZEROCOPY;  // Enable zero-copy
+    msg.msg_flags |= MSG_ZEROCOPY;
 
     len = sendmsg(events[i].data.fd, &msg, MSG_NOSIGNAL);
     if (len == (size_t)-1) {
         std::cout << "error sending data, " << strerror(errno) << std::endl;
     }
+}
+
+void send_data_zero_copy(int fd, std::shared_ptr<RingBuffer> output_buffer) {
+    struct iovec iov;
+    if (!output_buffer->getReadBuffer(&iov, output_buffer->available())) {
+        return;
+    }
+    
+    if (iov.iov_len == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(connections_mutex);
+    auto conn_it = connections.find(fd);
+    if (conn_it == connections.end()) {
+        return;
+    }
+    
+    auto& ctx = conn_it->second;
+    
+    if (TLSManager::getInstance().isEnabled() && ctx->ssl && ctx->tls_handshake_complete) {
+        int sent = SSL_write(ctx->ssl, iov.iov_base, iov.iov_len);
+        if (sent > 0) {
+            output_buffer->advanceRead(sent);
+        }
+    } else {
+        struct msghdr msg = {};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_flags = MSG_ZEROCOPY;
+
+        ssize_t sent = sendmsg(fd, &msg, MSG_NOSIGNAL);
+        if (sent > 0) {
+            ctx->pending_sends++;
+            output_buffer->advanceRead(sent);
+        } else if (sent == -1) {
+            std::cout << "error sending data: " << strerror(errno) << std::endl;
+        }
+    }
+}
+
+bool handle_zero_copy_completion(int fd) {
+    char control[100];
+    struct msghdr msg = {};
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    ssize_t ret = recvmsg(fd, &msg, MSG_ERRQUEUE);
+    if (ret == -1) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            std::cout << "Error reading error queue: " << strerror(errno) << std::endl;
+        }
+        return false;
+    }
+
+    struct cmsghdr *cm;
+    for (cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm)) {
+        if (cm->cmsg_level == SOL_IP && cm->cmsg_type == IP_RECVERR) {
+            struct sock_extended_err *serr = (struct sock_extended_err*)CMSG_DATA(cm);
+            if (serr->ee_origin == SO_EE_ORIGIN_ZEROCOPY) {
+                std::lock_guard<std::mutex> lock(connections_mutex);
+                auto conn_it = connections.find(fd);
+                if (conn_it != connections.end()) {
+                    conn_it->second->pending_sends--;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /**
