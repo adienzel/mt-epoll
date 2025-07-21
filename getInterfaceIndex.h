@@ -217,6 +217,12 @@ struct interface_list_t {
     while (address) {
         interface_list_t interface {};
         interface.interface_name = address->ifa_name;
+        
+        if (address->ifa_addr == nullptr) {
+            address = address->ifa_next;
+            continue;
+        }
+        
         interface.family = address->ifa_addr->sa_family;
         interface.family_name = getFamilyName(interface.family);
         
